@@ -90,6 +90,7 @@ while [[ $# -gt 0 ]]; do
     --trim-cuda)       TRIM_CUDA=1 ;;
     --skip-sigcheck)   SKIP_SIG=1 ;;
     --proprietary)     DRIVER_MODE=proprietary ;;
+    --proprietary-version) PROPRIETARY_VER="${2:?--proprietary-version needs an argument (e.g. 580.119.02)}"; shift ;;
     --workdir)         WORKDIR="${2:?--workdir needs an argument}"; shift ;;
     -h|--help)         sed -n '2,66p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     -*)                die "Unknown option: $1" ;;
@@ -243,36 +244,61 @@ log "Headers package: $(basename "$HDR_URL")"
 #
 # DRIVER_MODE:
 #   open        -> nvidia-open-dkms  (Turing / RTX 20-series and newer only)
-#   proprietary  -> nvidia-dkms      (Pascal / GTX 10-series and newer; needed
-#                                     for cards nvidia-open does not support,
-#                                     e.g. a GTX 1050)
+#   proprietary  -> nvidia-dkms      (Pascal / GTX 10-series, e.g. a GTX 1050)
+#
+# IMPORTANT (Pascal / proprietary): NVIDIA dropped Pascal (GTX 10xx) support at
+# driver 590, and Arch consequently DELETED the proprietary nvidia-dkms /
+# nvidia-utils packages from the current repos (590+ only ships nvidia-open).
+# The last Pascal-capable proprietary release is 580.x, which is still on
+# archive.archlinux.org. So in --proprietary mode we PIN 580.119.02 from the
+# archive directly instead of resolving "latest" (which would 404). Override
+# with --proprietary-version if a newer Pascal driver appears.
+PROPRIETARY_VER="${PROPRIETARY_VER:-580.119.02}"
 if [[ "$DRIVER_MODE" == proprietary ]]; then
-  PKG_SPECS=(extra/nvidia-dkms extra/nvidia-utils multilib/lib32-nvidia-utils extra/egl-wayland2)
   OPEN_DRIVER=0
   log "Driver mode: PROPRIETARY (nvidia-dkms — Pascal/GTX 10xx and newer)"
+  log "Pinning last Pascal-capable proprietary driver $PROPRIETARY_VER (Arch dropped Pascal at 590)"
+  declare -A PIN=(
+    [nvidia-dkms]="n/nvidia-dkms/nvidia-dkms-${PROPRIETARY_VER}-1-x86_64.pkg.tar.zst"
+    [nvidia-utils]="n/nvidia-utils/nvidia-utils-${PROPRIETARY_VER}-1-x86_64.pkg.tar.zst"
+    [lib32-nvidia-utils]="l/lib32-nvidia-utils/lib32-nvidia-utils-${PROPRIETARY_VER}-1-x86_64.pkg.tar.zst"
+  )
+  PKG_SPECS=()
+  for p in nvidia-dkms nvidia-utils lib32-nvidia-utils; do
+    PKG_SPECS+=("archive/$p")   # archive/ prefix => use the pinned archive path
+  done
+  PKG_SPECS+=(extra/egl-wayland2)   # driver-agnostic, take current Arch
 else
-  PKG_SPECS=(extra/nvidia-open-dkms extra/nvidia-utils multilib/lib32-nvidia-utils extra/egl-wayland2)
   OPEN_DRIVER=1
   log "Driver mode: OPEN (nvidia-open-dkms — Turing/RTX 20xx and newer)"
+  PKG_SPECS=(extra/nvidia-open-dkms extra/nvidia-utils multilib/lib32-nvidia-utils extra/egl-wayland2)
 fi
-log "Resolving latest NVIDIA driver from Arch Linux"
+log "Resolving NVIDIA driver packages"
 PKG_URLS=""            # pinned URLs, space-separated (also goes in driver.conf)
 PKG_FILES=()           # local filenames in $WORKDIR/pkgs
 DRIVER_VERSION=""      # nvidia-utils pkgver-pkgrel
 NV_PKGVER=""           # pkgver only, for cross-package consistency check
 for spec in "${PKG_SPECS[@]}"; do
-  repo="${spec%/*}"; pkg="${spec#*/}"
-  line="$(curl -sfL "https://archlinux.org/packages/$repo/x86_64/$pkg/json/" \
-          | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["pkgver"]+"-"+d["pkgrel"], d["filename"])')" \
-    || die "Could not resolve $pkg from archlinux.org"
-  ver="${line%% *}"; file="${line#* }"
-  [[ "$pkg" == nvidia-utils ]] && { DRIVER_VERSION="$ver"; NV_PKGVER="${ver%-*}"; }
-  url="https://archive.archlinux.org/packages/${pkg:0:1}/$pkg/$file"
-  if ! curl -sfIL "$url" -o /dev/null; then
-    url="https://geo.mirror.pkgbuild.com/$repo/os/x86_64/$file"
-    curl -sfIL "$url" -o /dev/null || die "$pkg $ver not on archive.archlinux.org nor the mirror"
-    warn "$pkg not yet in the Arch archive — pinning mirror URL (may go stale)"
+  repo="${spec%%/*}"; pkg="${spec#*/}"
+  if [[ "$repo" == archive ]]; then
+    # pre-pinned archive path (proprietary Pascal driver)
+    file="${PIN[$pkg]##*/}"
+    url="https://archive.archlinux.org/packages/${PIN[$pkg]}"
+    curl -sfIL "$url" -o /dev/null || die "Pinned proprietary package missing from archive: $url"
+    ver="$PROPRIETARY_VER-1"
+  else
+    line="$(curl -sfL "https://archlinux.org/packages/$repo/x86_64/$pkg/json/" \
+            | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["pkgver"]+"-"+d["pkgrel"], d["filename"])')" \
+      || die "Could not resolve $pkg from archlinux.org"
+    ver="${line%% *}"; file="${line#* }"
+    url="https://archive.archlinux.org/packages/${pkg:0:1}/$pkg/$file"
+    if ! curl -sfIL "$url" -o /dev/null; then
+      url="https://geo.mirror.pkgbuild.com/$repo/os/x86_64/$file"
+      curl -sfIL "$url" -o /dev/null || die "$pkg $ver not on archive.archlinux.org nor the mirror"
+      warn "$pkg not yet in the Arch archive — pinning mirror URL (may go stale)"
+    fi
   fi
+  [[ "$pkg" == nvidia-utils ]] && { DRIVER_VERSION="$ver"; NV_PKGVER="${ver%-*}"; }
   PKG_URLS+="${PKG_URLS:+ }$url"
   PKG_FILES+=("$file")
   log "  $pkg $ver"
